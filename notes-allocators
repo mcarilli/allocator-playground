@@ -1,0 +1,29 @@
+Defragmentation:
+
+Aliasing
+  On the fly
+    On demand
+    Full defrag when an OOM hits
+  Generic map
+    Bitrev, choose granularity based on allocation pattern when OOM hits
+Ring buffer
+Stack or deque based handle server
+
+How would async (stream ordered) page table updates help?
+  Simplest option: Map new one-off VA on demand if needed
+  Roll all freed VA forward to new VA?
+
+
+Stream pools:
+  stream1 waits for stream2
+    merge stream2's frees into stream1's frees, BUT NOT vice versa
+  Timestamp-based approach?
+    Each stream maintains its own VA pool (reserve large VA up front, map PA on demand as it grows).
+    Each pool has an associated timestamp (uint64).
+    Frees increment timestamps.
+    On sync, stream1 saves current timestamp associated with stream2's pool
+      Cumulativity:
+        On sync, stream1 can also inherit current timestamps stream2 stashed from syncing with other streams.
+          These update stream1's timestamps stashed from syncing with those other streams (if any are less)
+
+Timestamps + per-stream handle deque could add multistreaming to the static dry-run-based allocator.
