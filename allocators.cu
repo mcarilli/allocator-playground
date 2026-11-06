@@ -233,6 +233,7 @@ struct FuzzAllocation {
 int main() {
   // Initialize primary context
   // https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/driver-api.html#interoperability-between-runtime-and-driver-apis
+  // https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__DRIVER.html
   CHK_RNT(cudaSetDevice(0));
 
   const size_t num_fuzz_allocations = 100;

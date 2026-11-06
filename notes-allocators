@@ -34,3 +34,126 @@ Timestamps + per-stream handle deque could add multistreaming to the static dry-
     cudaStreamSynchronize or cudaEventSynchronize
       Move that stream's handles to "globally available" stack.
       Delete that stream's pool (rebuild lazily if the stream is used again).
+
+For "allocation with sufficient size at minimum address"
+  Tree sorted by addresses. Each node has a size_t field containing the max available size in its subtree.
+    Two tree options:
+      Generalized buddy allocator
+        Tree holds both allocated and free chunks. All chunks are leaves. Parent nodes are organizational.
+      Binary search tree (set) of free chunks.
+        Every node (leafs and parents) is a free chunk.
+          Freeing an allocated chunk:
+            1. Search for fusion candidates.
+            2. If successful left fusion is found, delete the candidate from the tree and fuse with incoming freed chunk.
+            3. If successful right fusion is found, delete the candidate from the tree and fuse with incoming freed chunk.
+            4. Insert fused incoming chunk into the tree.
+            (assert: if you reached a fuseable node, it should not be fuseable with any ancestors, since you already should have discovered
+            they were fuseable on the way down)
+
+
+
+Buddy allocator can be augmented with per-size-bucket linked lists to speed up lookup. I think this makes malloc constant time average case.
+  https://github.com/evanw/buddy-malloc/blob/master/buddy-malloc.c
+
+
+
+
+
+❯ Let's say i have a fixed set of memory allocations where the sizes and order of allocation and deallocation are known ahead of time. Is there a known algorithm to pack them that minimizes the total memory high-water makr?
+
+Yes. This is the offline dynamic storage allocation (DSA) problem, sometimes called interval packing or weighted interval coloring. Each buffer is a rectangle with a fixed horizontal extent (its lifetime) and a height (its size). You choose a vertical offset for each one so that live rectangles never overlap, and you minimize the total height. That height is your high-water mark.
+
+Key facts about the problem
+
+- It is NP-hard. Stockmeyer showed this holds even when every size is 1 or 2. It appears as problem SR2 in Garey and Johnson. So there is no known efficient exact algorithm in general.
+- The obvious lower bound is the max load. That is the peak over time of the sum of all live sizes. The optimum is often equal to it, but not always. Fragmentation forced by the lifetime structure can push the optimum a small constant factor above it.
+- Unit sizes are easy. If all buffers are the same size, the interval graph is perfect. Sorting by start time and assigning greedily achieves exactly the max load. This is why the hardness comes entirely from mixed sizes.
+
+Approximation results
+
+- Kierstead proved First Fit by start time is a constant-factor approximation (a 6-approximation for the weighted case).
+- Gergov (1999) gave a 3-approximation.
+- Buchsbaum, Karloff, Kenyon, Reingold, and Thorup (2003) gave a (2+ε)-approximation, and showed the optimum approaches the max load when every buffer is small relative to the peak. That regime matches most real workloads.
+
+What practitioners actually use
+
+- Greedy heuristics. Sort buffers by size descending (or by lifetime length) and place each at the lowest offset that fits given already-placed overlapping buffers. This is what XLA's heap simulator does (GlobalDecreasingSizeBestFitHeap) and what the TFLite memory planner does, described in Pisarchyk and Lee, "Efficient Memory Management for Deep Neural Net Inference" (2020). Greedy-by-size usually gets within a few percent of the lower bound and often hits it.
+- Exact solvers for moderate instance sizes. Since the instance is fully known offline, you can formulate it as an ILP or constraint program and solve it exactly for up to a few thousand buffers. Google published two solvers tuned for this: TelaMalloc (Maas et al., ASPLOS 2023) and MiniMalloc (Moffitt, ASPLOS 2024). MiniMalloc is open source and solves XLA-sized instances in seconds using branch and bound with strong dominance pruning. It is probably the best starting point if you want optimal rather than heuristic.
+- Hybrid. Run greedy first. If it hits the max-load lower bound, you are done and provably optimal. Otherwise hand the instance to an exact solver with the greedy result as an upper bound.
+
+Two practical caveats
+
+- Alignment and allocation granularity change the sizes, so compute the lower bound on the rounded sizes, not the nominal ones.
+- If your sizes are all powers of two or otherwise nicely nested, buddy-style placement can also reach the lower bound without a solver, since nested sizes avoid the awkward fragmentation that makes the general problem hard.
+
+
+
+Session 2, 2026-10-18 00:17 (after /login and /model set to Fable 5.1)
+
+▎ You: Is it possible to create a custom comparator for an std::set such that every element in the set knows its position in the overall sorted order?
+
+▎ Claude: No. A comparator can't do it, and the limitation is structural rather than something cleverness in the comparator can work around.
+▎
+▎ Why a comparator can't help
+▎
+▎ - The comparator only ever sees two elements at a time. It never sees the tree, the subtree sizes, or where the insertion landed.
+▎ - Positions are not a local property. Inserting one element shifts the rank of every element after it, so "each element knows its position" implies O(n) work per insert or erase no matter who does it.
+▎ - std::set is a red-black tree whose nodes don't store subtree sizes, so even the container itself can't answer "what is the rank of this element" faster than std::distance(s.begin(), it), which is O(n).
+▎
+▎ What you actually want is an order-statistic tree
+▎
+▎ If you're on GCC or Clang with libstdc++, the policy-based data structures extension gives you exactly this with O(log n) rank queries:
+▎
+▎ #include <ext/pb_ds/assoc_container.hpp>
+▎ #include <ext/pb_ds/tree_policy.hpp>
+▎ using namespace __gnu_pbds;
+▎
+▎ template <class T, class Cmp = std::less<T>>
+▎ using ordered_set = tree<T, null_type, Cmp, rb_tree_tag,
+▎                          tree_order_statistics_node_update>;
+▎
+▎ ordered_set<int> s;
+▎ s.insert(10); s.insert(20); s.insert(30);
+▎ s.order_of_key(20);   // 1  : number of elements strictly less than 20
+▎ *s.find_by_order(2);  // 30 : element at rank 2
+▎
+▎ Note that tree with rb_tree_tag rejects duplicate keys. For a multiset, use pairs of (value, unique_id) as the key.
+▎
+▎ Other options depending on your workload
+▎
+▎ - Portable implementation. Write a treap or AVL tree augmented with subtree sizes. Rank and select are both O(log n). This is standard and not much code.
+▎ - Mostly reads, rare writes. Keep a sorted std::vector. Rank is lower_bound minus begin, O(log n). Inserts are O(n) but with a tiny constant, which often beats a tree in practice.
+▎ - Known key universe. Coordinate-compress the keys and use a Fenwick tree of counts. Rank is a prefix sum, O(log n), and it handles duplicates naturally.
+▎ - Boost. boost::intrusive containers and boost::multi_index support ranked or random-access indices on top of ordered sets.
+▎
+▎ If you tell me what your access pattern looks like, I can suggest which of these fits best.
+
+---
+
+Session 3, 2026-10-18 19:57
+
+▎ You: Is it possible to make an efficient caching allocator where malloc returns the contiguous block of memory at the lowest address that's big enough to satisfy the requested size?
+
+▎ Claude: Yes. The classic objection to address-ordered first fit is that a linear scan of the free list is O(n), but the search is really a "leftmost element with size ≥ k" query, and that is O(log n) with the right data structure. Several production allocators do exactly this.
+▎
+▎ The standard trick: an address-keyed tree augmented with subtree max size. Keep free blocks in a balanced tree ordered by address. Each node also stores the largest free block size anywhere in its subtree. The search descends from the root:
+▎
+▎ find_lowest_fit(node, k):
+▎     if node.left and node.left.max_size >= k:  go left
+▎     elif node.size >= k:                        return node
+▎     else:                                       go right   # right.max_size must be >= k, or no fit exists
+▎
+▎ Because you always prefer left when the left subtree can satisfy the request, the first node you stop at is the lowest address that fits. Insert, delete, split, and coalesce are all O(log n). Coalescing is easy because address order gives you the neighbors directly as predecessor and successor, so you don't even need boundary tags. The augmentation is maintained on rotations the same way a segment tree or order-statistics tree maintains its summaries.
+▎
+▎ Linux uses precisely this for the kernel virtual address range: mm/vmalloc.c keeps free vmap areas in an rbtree augmented with subtree_max_size, and find_vmap_lowest_match is the descent above. Stephenson's "Fast Fits" (1983) is the older version of the same idea using a Cartesian tree, keyed by address with heap order on size.
+▎
+▎ If block granularity is fixed, a segment tree over a bitmap is even better. For a caching allocator that rounds to a page or chunk size, represent each segment as an array of chunks and build a segment tree where each node stores the longest free run inside it, plus the free run touching its left edge and its right edge. Merging two children is three comparisons. Lowest-address fit is again a left-preferring descent in O(log P). This is contiguous, cache-friendly, and has no per-block headers, which matters when the memory you're managing is on a device you can't put metadata in.
+▎
+▎ Trade-offs worth knowing before switching from best fit.
+▎
+▎ - Address-ordered first fit tends to create a litter of small splinters at the low end as big blocks get split from the front. Every search skips them in O(log n) so it's not a time problem, but they are fragmentation.
+▎ - The usual reason to want it is that it concentrates live data at low addresses, leaving the high end of each segment empty and therefore releasable. That works best when you also order segments by something sensible, since "lowest address" across independently allocated segments is an arbitrary total order. Ordering by segment base address is fine; ordering by segment age or fullness is sometimes better for trimming.
+▎ - In Wilson et al.'s 1995 survey, address-ordered first fit and best fit had roughly the same, low, fragmentation on real workloads, and both beat LIFO or size-ordered first fit. So you're paying similar per-op cost for a different placement bias, not a strictly better one.
+▎ - A caching allocator with per-stream pools needs one tree per pool, or a stream component as the primary key. Cross-stream address order is meaningless because blocks aren't interchangeable across streams anyway.
+▎
+▎ If you want a cheap approximation instead of exact lowest address, jemalloc's approach is to bin free extents by size class and pick the lowest address within the smallest class that fits. That gives most of the locality benefit with simpler bookkeeping, but it is not globally lowest-address.
